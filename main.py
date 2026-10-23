@@ -2,6 +2,7 @@ import os
 import discord
 
 from enum import StrEnum
+from typing import Any
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
