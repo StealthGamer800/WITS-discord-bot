@@ -73,6 +73,15 @@ async def edit_role(
         )
         return
 
+    # right now you can give someone the same rank as your self i.e. as 
+    # a Captain you can give Captain. and we might want to change that
+    caller_role: discord.Role | Any | None = get_role(interaction.user)
+    if caller_role is None or input_role.rank < Role(caller_role.name).rank:
+        await interaction.response.send_message(
+            "You cannot give a role higher than yours", ephemeral=True
+        )
+        return
+
     # now we need to find target_user's old role
     old_role: discord.Role | None = get_role(target_user)
 
