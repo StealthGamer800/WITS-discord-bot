@@ -136,16 +136,25 @@ def save_guild_members(members: Iterable[GuildMember]) -> None:
         )
 
 
+async def refresh_guild_members() -> bool:
+    """Fetch the roster from the Wynncraft API into memory and the database."""
+    try:
+        members = await fetch_guild_members()
+    except (aiohttp.ClientError, TimeoutError, KeyError, ValueError) as e:
+        print(f"Failed to fetch Wynncraft guild members: {e!r}")
+        return False
+
+    guild_members.clear()
+    guild_members.update(members)
+    save_guild_members(members.values())
+    return True
+
+
 @bot.event
 async def setup_hook():
     # Runs once before connecting to Discord (on_ready can fire again on reconnects)
-    try:
-        guild_members.update(await fetch_guild_members())
-    except (aiohttp.ClientError, TimeoutError, KeyError, ValueError) as e:
-        print(f"Failed to fetch Wynncraft guild members: {e!r}")
+    if not await refresh_guild_members():
         return
-
-    save_guild_members(guild_members.values())
 
     print(f"Loaded {len(guild_members)} Wynncraft guild members:")
     for m in sorted(guild_members.values(), key=lambda m: -m.rank.rank):
@@ -235,10 +244,45 @@ async def demote(interaction: discord.Interaction, target_user: discord.Member):
     await shift_rank(interaction, target_user, -1)
 
 
+async def set_rank_role(member: discord.Member, rank: Role, reason: str) -> str:
+    """Give `member` the Discord role for `rank`, removing any other rank roles.
+
+    Returns a message describing what happened, for the user.
+    """
+    if rank == Role.EVERYONE:
+        target = None
+    elif (target := discord.utils.get(member.guild.roles, name=rank)) is None:
+        return f"The **{rank}** role doesn't exist in this server, so I couldn't assign it."
+
+    # Every rank role they have except the one they should have
+    stale = [
+        r for r in member.roles if r.name in Role and r != target and not r.is_default()
+    ]
+
+    try:
+        if stale:
+            await member.remove_roles(*stale, reason=reason)
+        if target is not None and target not in member.roles:
+            await member.add_roles(target, reason=reason)
+    except discord.Forbidden:
+        return (
+            f"I don't have permission to give you the **{rank}** role. "
+            "My role needs to be above the rank roles in the server settings."
+        )
+    return f"You've been given the **{rank}** role."
+
+
 @bot.tree.command(
     name="link", description="Link your Minecraft account using the code you got"
 )
+@app_commands.guild_only()
 async def link(interaction: discord.Interaction, code: str):
+    # guild_only() guarantees this at runtime; the check narrows the type for mypy
+    if not isinstance(interaction.user, discord.Member):
+        return
+
+    # Fetching the roster can take a few seconds; Discord needs a reply within 3
+    await interaction.response.defer(ephemeral=True)
     code = code.strip().upper().replace("-", "").replace(" ", "")
 
     with db:  # one transaction: consume the code and write the link together
@@ -248,7 +292,7 @@ async def link(interaction: discord.Interaction, code: str):
         ).fetchone()
 
         if row is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "That code is invalid or expired. Join the link server again to get a new one.",
                 ephemeral=True,
             )
@@ -266,9 +310,24 @@ async def link(interaction: discord.Interaction, code: str):
             (interaction.user.id, mc_uuid, mc_name, int(time.time())),
         )
 
-    await interaction.response.send_message(
-        f"Linked to Minecraft account **{mc_name}**.", ephemeral=True
-    )
+    message = f"Linked to Minecraft account **{mc_name}**."
+
+    # Use the latest roster so people who joined the guild since startup are
+    # found; if the API is down this falls back to the last saved roster.
+    await refresh_guild_members()
+    rank_row = db.execute(
+        "SELECT rank FROM guild_members WHERE mc_uuid = ?", (mc_uuid,)
+    ).fetchone()
+
+    if rank_row is None:
+        message += f"\n**{mc_name}** isn't in the {os.environ['WYNN_GUILD_NAME']} guild, so no rank role was given."
+    else:
+        reason = f"/link: {mc_name} is {rank_row[0]} in {os.environ['WYNN_GUILD_NAME']}"
+        message += "\n" + await set_rank_role(
+            interaction.user, Role(rank_row[0]), reason
+        )
+
+    await interaction.followup.send(message, ephemeral=True)
 
 
 @bot.tree.command(name="unlink", description="Unlink your Minecraft account")
