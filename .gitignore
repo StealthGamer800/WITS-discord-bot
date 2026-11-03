@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Minecraft link server
+link-server/node_modules/
+links.db
+links.db-*
