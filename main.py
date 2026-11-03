@@ -1,11 +1,15 @@
 import os
 import sqlite3
 import time
+import aiohttp
 import discord
 
+from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
+from urllib.parse import quote
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -30,6 +34,14 @@ db.executescript("""
         mc_uuid    TEXT NOT NULL UNIQUE,
         mc_name    TEXT NOT NULL,
         linked_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS guild_members (
+        mc_uuid    TEXT PRIMARY KEY,
+        mc_name    TEXT NOT NULL,
+        rank       TEXT NOT NULL,
+        online     INTEGER NOT NULL,
+        last_join  INTEGER,          -- unix seconds, NULL if unknown
+        fetched_at INTEGER NOT NULL
     );
 """)
 
@@ -60,6 +72,89 @@ def get_role(member: discord.Member) -> discord.Role | None:
         if r.name in Role:
             return r
     return None
+
+
+@dataclass
+class GuildMember:
+    name: str
+    uuid: str
+    rank: Role
+    online: bool
+    last_join: datetime | None  # None if the player has never joined / hides it
+
+
+# uuid -> member, filled from the Wynncraft API on startup
+guild_members: dict[str, GuildMember] = {}
+
+
+async def fetch_guild_members() -> dict[str, GuildMember]:
+    guild_name = os.environ["WYNN_GUILD_NAME"]
+    url = f"https://api.wynncraft.com/v3/guild/{quote(guild_name)}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    members: dict[str, GuildMember] = {}
+    # data["members"] is {"total": n, "owner": {name: {...}}, "chief": {...}, ...}
+    for rank_name, by_name in data["members"].items():
+        if not isinstance(by_name, dict):
+            continue
+        rank = Role(rank_name.capitalize())
+        for name, info in by_name.items():
+            last_join = info.get("lastJoin")
+            members[info["uuid"]] = GuildMember(
+                name=name,
+                uuid=info["uuid"],
+                rank=rank,
+                online=info.get("online", False),
+                last_join=datetime.fromisoformat(last_join) if last_join else None,
+            )
+    return members
+
+
+def save_guild_members(members: Iterable[GuildMember]) -> None:
+    """Replace the stored roster with `members`, so people who left are removed."""
+    now = int(time.time())
+    with db:
+        db.execute("DELETE FROM guild_members")
+        db.executemany(
+            "INSERT INTO guild_members (mc_uuid, mc_name, rank, online, last_join, fetched_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    m.uuid,
+                    m.name,
+                    str(m.rank),
+                    int(m.online),
+                    int(m.last_join.timestamp()) if m.last_join else None,
+                    now,
+                )
+                for m in members
+            ],
+        )
+
+
+@bot.event
+async def setup_hook():
+    # Runs once before connecting to Discord (on_ready can fire again on reconnects)
+    try:
+        guild_members.update(await fetch_guild_members())
+    except (aiohttp.ClientError, TimeoutError, KeyError, ValueError) as e:
+        print(f"Failed to fetch Wynncraft guild members: {e!r}")
+        return
+
+    save_guild_members(guild_members.values())
+
+    print(f"Loaded {len(guild_members)} Wynncraft guild members:")
+    for m in sorted(guild_members.values(), key=lambda m: -m.rank.rank):
+        seen = (
+            "online now"
+            if m.online
+            else m.last_join.strftime("%Y-%m-%d %H:%M UTC") if m.last_join else "never"
+        )
+        print(f"  {m.rank:<10} {m.name:<16} {seen}")
 
 
 @bot.event
