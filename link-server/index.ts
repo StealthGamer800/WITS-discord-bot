@@ -25,7 +25,15 @@ db.exec(`CREATE TABLE IF NOT EXISTS pending_codes (
   mc_name    TEXT NOT NULL,
   expires_at INTEGER NOT NULL
 )`)
+// Owned by the bot, but created here too in case the link server starts first
+db.exec(`CREATE TABLE IF NOT EXISTS links (
+  discord_id INTEGER PRIMARY KEY,
+  mc_uuid    TEXT NOT NULL UNIQUE,
+  mc_name    TEXT NOT NULL,
+  linked_at  INTEGER NOT NULL
+)`)
 
+const isLinked = db.prepare('SELECT 1 FROM links WHERE mc_uuid = ?')
 const purge = db.prepare('DELETE FROM pending_codes WHERE mc_uuid = ? OR expires_at < ?')
 const insert = db.prepare('INSERT INTO pending_codes (code, mc_uuid, mc_name, expires_at) VALUES (?, ?, ?, ?)')
 
@@ -60,6 +68,16 @@ function issueCode (client: Client): void {
   const nowSeconds = Math.floor(now / 1000)
   let code: string
   try {
+    if (isLinked.get(client.uuid) !== undefined) {
+      console.log(`${client.username} (${client.uuid}) is already linked, no code issued`)
+      kick(
+        '§eThis Minecraft account is already linked to Discord.\n\n' +
+        '§7If something is wrong, run §f/unlink §7in the WITS Discord,\n' +
+        '§7then join again to get a new code.'
+      )
+      return
+    }
+
     // One live code per Minecraft account; also sweeps expired codes.
     purge.run(client.uuid, nowSeconds)
     code = makeCode()
