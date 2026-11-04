@@ -15,4 +15,4 @@ npm install
 npm start          # listens on 25565, override with LINK_SERVER_PORT
 ```
 
-Requires Node 22.5+ (uses the built-in `node:sqlite`). Accepts Minecraft 1.7 – 26.1 clients.
+Requires Node 23.6+ (runs `index.ts` directly via type stripping and uses the built-in `node:sqlite`). `npm run typecheck` checks the types. Accepts Minecraft 1.7 – 26.1 clients.

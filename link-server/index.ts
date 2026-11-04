@@ -1,16 +1,17 @@
-'use strict'
-
 // Minimal Minecraft "server" that only exists to prove account ownership.
 // A player joins, Mojang authenticates them (online mode), and they are
 // immediately kicked with a one-time code they redeem with /link in Discord.
+//
+// Run directly with `node index.ts` (Node strips the types; `npm run typecheck`
+// checks them).
 
-const path = require('node:path')
-const crypto = require('node:crypto')
-const { DatabaseSync } = require('node:sqlite')
-const mc = require('minecraft-protocol')
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
+import mc, { type Client } from 'minecraft-protocol'
 
 const PORT = Number(process.env.LINK_SERVER_PORT ?? 25565)
-const DB_PATH = process.env.LINK_DB_PATH ?? path.join(__dirname, '..', 'links.db')
+const DB_PATH = process.env.LINK_DB_PATH ?? path.join(import.meta.dirname, '..', 'links.db')
 const CODE_TTL_SECONDS = 5 * 60
 const IP_COOLDOWN_MS = 5_000
 
@@ -31,19 +32,19 @@ const insert = db.prepare('INSERT INTO pending_codes (code, mc_uuid, mc_name, ex
 // No 0/O/1/I so codes are easy to read off the kick screen. 32 symbols, so
 // `byte % 32` is unbiased.
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-const makeCode = () => Array.from(crypto.randomBytes(6), (b) => ALPHABET[b % 32]).join('')
+const makeCode = (): string => Array.from(crypto.randomBytes(6), (b) => ALPHABET[b % 32]).join('')
 
-const lastSeenByIp = new Map()
+const lastSeenByIp = new Map<string, number>()
 
 // Runs once Mojang has verified the player (client.uuid is trustworthy) but
 // before the login success packet. Kicking here uses the login-state
 // disconnect packet, which every client version displays correctly; kicking
 // from the 'login' event instead breaks on 1.20.2+ clients, which are already
 // in the configuration state by then.
-function issueCode (client) {
+function issueCode (client: Client): void {
   // minecraft-protocol keeps writing compress/success packets after this hook
   // returns; drop them so the disconnect is the last thing the client sees.
-  const kick = (message) => {
+  const kick = (message: string): void => {
     client.end(message)
     client.write = () => {}
   }
@@ -57,7 +58,7 @@ function issueCode (client) {
   lastSeenByIp.set(ip, now)
 
   const nowSeconds = Math.floor(now / 1000)
-  let code
+  let code: string
   try {
     // One live code per Minecraft account; also sweeps expired codes.
     purge.run(client.uuid, nowSeconds)
@@ -94,4 +95,4 @@ setInterval(() => {
 }, 60_000).unref()
 
 server.on('listening', () => console.log(`Link server listening on port ${PORT}, db: ${DB_PATH}`))
-server.on('error', (err) => console.error('Server error:', err))
+server.on('error', (err: Error) => console.error('Server error:', err))

@@ -1,0 +1,17 @@
+{
+  // Type-check only: Node runs index.ts directly by stripping the types.
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    // Only syntax Node can strip (no enums, namespaces, parameter properties)
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["*.ts"]
+}

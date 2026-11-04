@@ -2,13 +2,18 @@
   "name": "wits-link-server",
   "version": "1.0.0",
   "description": "Minecraft login server that issues Discord link codes",
-  "main": "index.js",
+  "main": "index.ts",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.ts",
+    "typecheck": "tsc"
   },
-  "type": "commonjs",
+  "type": "module",
   "dependencies": {
     "minecraft-protocol": "^1.68.0"
   },
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
 }
