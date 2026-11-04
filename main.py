@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sqlite3
 import time
@@ -5,13 +6,13 @@ import aiohttp
 import discord
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time as dtime, timezone
 from enum import StrEnum
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Iterable
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -136,23 +137,114 @@ def save_guild_members(members: Iterable[GuildMember]) -> None:
         )
 
 
-async def refresh_guild_members() -> bool:
-    """Fetch the roster from the Wynncraft API into memory and the database."""
-    try:
-        members = await fetch_guild_members()
-    except (aiohttp.ClientError, TimeoutError, KeyError, ValueError) as e:
-        print(f"Failed to fetch Wynncraft guild members: {e!r}")
-        return False
-
-    guild_members.clear()
-    guild_members.update(members)
-    save_guild_members(members.values())
-    return True
+@dataclass
+class RefreshResult:
+    member_count: int
+    roster_changes: list[str]  # promotions/demotions, joins and leaves
+    role_updates: list[str]  # what happened to linked Discord members
 
 
-@bot.event
-async def setup_hook():
-    # Runs once before connecting to Discord (on_ready can fire again on reconnects)
+# The hourly loop, /sync and /link can all refresh; don't let them interleave
+# or the same change could be diffed and applied twice.
+refresh_lock = asyncio.Lock()
+
+
+async def refresh_guild_members() -> RefreshResult | None:
+    """Fetch the roster from the Wynncraft API into memory and the database,
+    then update Discord roles for linked members whose rank changed.
+
+    Returns None if the API request failed."""
+    async with refresh_lock:
+        try:
+            members = await fetch_guild_members()
+        except (aiohttp.ClientError, TimeoutError, KeyError, ValueError) as e:
+            print(f"Failed to fetch Wynncraft guild members: {e!r}")
+            return None
+
+        # Diff against the saved roster (not memory) so changes that happened
+        # while the bot was offline are picked up on the next startup.
+        old: dict[str, tuple[str, str]] = {
+            uuid: (rank, name)
+            for uuid, rank, name in db.execute(
+                "SELECT mc_uuid, rank, mc_name FROM guild_members"
+            )
+        }
+        # New rank, or newly joined the guild
+        changed = [
+            m for m in members.values() if m.uuid not in old or old[m.uuid][0] != m.rank
+        ]
+
+        roster_changes = [
+            (
+                f"{m.name}: {old[m.uuid][0]} → {m.rank}"
+                if m.uuid in old
+                else f"{m.name} joined as {m.rank}"
+            )
+            for m in changed
+        ]
+        roster_changes += [
+            f"{name} left the guild (Discord roles left unchanged)"
+            for uuid, (_, name) in old.items()
+            if uuid not in members
+        ]
+
+        guild_members.clear()
+        guild_members.update(members)
+        save_guild_members(members.values())
+
+        for line in roster_changes:
+            print(f"Roster: {line}")
+        role_updates = await sync_rank_roles(changed) if changed else []
+
+        return RefreshResult(len(members), roster_changes, role_updates)
+
+
+async def sync_rank_roles(changed: list[GuildMember]) -> list[str]:
+    """Give linked Discord members the role for their new Wynncraft rank.
+
+    Returns a line per linked member describing what happened."""
+    placeholders = ",".join("?" * len(changed))
+    linked: dict[str, int] = {
+        uuid: discord_id
+        for discord_id, uuid in db.execute(
+            f"SELECT discord_id, mc_uuid FROM links WHERE mc_uuid IN ({placeholders})",
+            [m.uuid for m in changed],
+        )
+    }
+    if not linked:
+        return []
+
+    # The startup refresh runs before the bot has connected
+    await bot.wait_until_ready()
+    guild = bot.get_guild(int(os.environ["DISCORD_GUILD_ID"]))
+    if guild is None:
+        print("Can't sync rank roles: bot isn't in DISCORD_GUILD_ID")
+        return ["Couldn't update roles: the bot isn't in the configured server."]
+
+    updates = []
+    for m in changed:
+        if (discord_id := linked.get(m.uuid)) is None:
+            continue
+        try:
+            member = await guild.fetch_member(discord_id)
+        except discord.NotFound:
+            continue  # linked, but no longer in the Discord server
+        result = await set_rank_role(
+            member, m.rank, f"Wynncraft rank sync: {m.name} is now {m.rank}"
+        )
+        print(f"Rank sync {m.name} -> {member}: {result}")
+        updates.append(f"{member.mention} ({m.name}): {result}")
+    return updates
+
+
+# Every hour on the hour (UTC). `time` is the stdlib module, hence dtime.
+@tasks.loop(time=[dtime(hour=h, tzinfo=timezone.utc) for h in range(24)])
+async def hourly_guild_refresh():
+    if await refresh_guild_members():
+        print(f"Hourly refresh: {len(guild_members)} Wynncraft guild members")
+
+
+async def startup_guild_refresh():
     if not await refresh_guild_members():
         return
 
@@ -164,6 +256,21 @@ async def setup_hook():
             else m.last_join.strftime("%Y-%m-%d %H:%M UTC") if m.last_join else "never"
         )
         print(f"  {m.rank:<10} {m.name:<16} {seen}")
+
+
+background_tasks: set[asyncio.Task] = set()
+
+
+@bot.event
+async def setup_hook():
+    # Runs once before connecting to Discord (on_ready can fire again on reconnects)
+    hourly_guild_refresh.start()
+
+    # In the background: role syncing has to wait until the bot has connected,
+    # which can't happen until setup_hook returns.
+    task = asyncio.create_task(startup_guild_refresh())
+    background_tasks.add(task)  # keep a reference so it isn't garbage collected
+    task.add_done_callback(background_tasks.discard)
 
 
 @bot.event
@@ -242,6 +349,36 @@ async def promote(interaction: discord.Interaction, target_user: discord.Member)
 @app_commands.guild_only()
 async def demote(interaction: discord.Interaction, target_user: discord.Member):
     await shift_rank(interaction, target_user, -1)
+
+
+@bot.tree.command(
+    name="sync",
+    description="Fetch the latest Wynncraft guild data and update rank roles",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_roles=True)
+async def sync(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    result = await refresh_guild_members()
+    if result is None:
+        await interaction.followup.send(
+            "Couldn't reach the Wynncraft API, try again in a bit.", ephemeral=True
+        )
+        return
+
+    lines = [f"Synced **{result.member_count}** guild members."]
+    if result.roster_changes:
+        lines += ["", "**Roster changes**"] + [f"- {c}" for c in result.roster_changes]
+    if result.role_updates:
+        lines += ["", "**Role updates**"] + [f"- {u}" for u in result.role_updates]
+    if not result.roster_changes:
+        lines.append("No rank changes since the last sync.")
+
+    message = "\n".join(lines)
+    if len(message) > 2000:  # Discord's message limit; full detail is in the bot log
+        message = message[:1950] + "\n… (truncated, see the bot log)"
+    await interaction.followup.send(message, ephemeral=True)
 
 
 async def set_rank_role(member: discord.Member, rank: Role, reason: str) -> str:
