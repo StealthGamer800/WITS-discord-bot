@@ -422,6 +422,18 @@ async def link(interaction: discord.Interaction, code: str):
     await interaction.response.defer(ephemeral=True)
     code = code.strip().upper().replace("-", "").replace(" ", "")
 
+    # Checked before touching the code, so it isn't used up
+    linked = db.execute(
+        "SELECT mc_name FROM links WHERE discord_id = ?", (interaction.user.id,)
+    ).fetchone()
+    if linked is not None:
+        await interaction.followup.send(
+            f"Your Discord account is already linked to **{linked[0]}**.\n"
+            "If something is wrong, run `/unlink`, then join the link server again to get a new code.",
+            ephemeral=True,
+        )
+        return
+
     with db:  # one transaction: consume the code and write the link together
         row = db.execute(
             "DELETE FROM pending_codes WHERE code = ? AND expires_at > ? RETURNING mc_uuid, mc_name",
