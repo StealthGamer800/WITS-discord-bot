@@ -7,7 +7,10 @@ verifies their account and they are immediately kicked with a one-time code. The
 run `/link <code>` in Discord to link the two accounts (`/unlink` removes it).
 
 The server and the bot share a SQLite database (`links.db` in the repo root, or
-set `LINK_DB_PATH` for both).
+set `LINK_DB_PATH` for both). The bot owns it: **start the bot first**, since it
+creates the database (schema in `wits/db.py`). The link server never creates or
+changes it; on startup it checks the tables and columns it uses and exits with an
+error if anything is missing or doesn't match.
 
 ```sh
 cd link-server

@@ -7,6 +7,7 @@
 
 import path from 'node:path'
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import mc, { type Client } from 'minecraft-protocol'
 
@@ -15,23 +16,66 @@ const DB_PATH = process.env.LINK_DB_PATH ?? path.join(import.meta.dirname, '..',
 const CODE_TTL_SECONDS = 5 * 60
 const IP_COOLDOWN_MS = 5_000
 
-// Must match the schema in main.py
-const db = new DatabaseSync(DB_PATH)
-db.exec('PRAGMA journal_mode = WAL')
-db.exec('PRAGMA busy_timeout = 5000')
-db.exec(`CREATE TABLE IF NOT EXISTS pending_codes (
-  code       TEXT PRIMARY KEY,
-  mc_uuid    TEXT NOT NULL,
-  mc_name    TEXT NOT NULL,
-  expires_at INTEGER NOT NULL
-)`)
-// Owned by the bot, but created here too in case the link server starts first
-db.exec(`CREATE TABLE IF NOT EXISTS links (
-  discord_id INTEGER PRIMARY KEY,
-  mc_uuid    TEXT NOT NULL UNIQUE,
-  mc_name    TEXT NOT NULL,
-  linked_at  INTEGER NOT NULL
-)`)
+// The bot owns the database and its schema (wits/db.py). This server never
+// creates or alters it; it only checks the parts it uses are as expected.
+const EXPECTED_SCHEMA: Record<string, Record<string, string>> = {
+  pending_codes: { code: 'TEXT', mc_uuid: 'TEXT', mc_name: 'TEXT', expires_at: 'INTEGER' },
+  links: { mc_uuid: 'TEXT' }
+}
+const INSERTED_TABLES = new Set(['pending_codes'])
+
+interface ColumnInfo {
+  name: string
+  type: string
+  notnull: number
+  dflt_value: unknown
+  pk: number
+}
+
+function fail (message: string): never {
+  console.error(`Can't start link server: ${message}`)
+  process.exit(1)
+}
+
+function checkSchema (db: DatabaseSync): string[] {
+  const problems: string[] = []
+  for (const [table, expected] of Object.entries(EXPECTED_SCHEMA)) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as ColumnInfo[]
+    if (columns.length === 0) {
+      problems.push(`table "${table}" is missing`)
+      continue
+    }
+    const actual = new Map(columns.map((c) => [c.name, c]))
+    for (const [name, type] of Object.entries(expected)) {
+      const column = actual.get(name)
+      if (column === undefined) problems.push(`column "${table}.${name}" is missing`)
+      else if (column.type.toUpperCase() !== type) {
+        problems.push(`column "${table}.${name}" is ${column.type}, expected ${type}`)
+      }
+    }
+    // Inserts only set the expected columns, so any other required column would make them fail
+    if (!INSERTED_TABLES.has(table)) continue
+    for (const c of columns) {
+      if (!(c.name in expected) && c.notnull && c.dflt_value === null && !c.pk) {
+        problems.push(`column "${table}.${c.name}" is NOT NULL with no default, but this server doesn't set it`)
+      }
+    }
+  }
+  return problems
+}
+
+// DatabaseSync would silently create an empty file, so check it exists first
+if (!fs.existsSync(DB_PATH)) {
+  fail(`no database at ${DB_PATH}. Start the bot first, it creates the database.`)
+}
+const db = new DatabaseSync(DB_PATH, { timeout: 5000 })
+const schemaProblems = checkSchema(db)
+if (schemaProblems.length > 0) {
+  fail(
+    `${DB_PATH} doesn't match the schema this server expects (see wits/db.py):\n` +
+    schemaProblems.map((p) => `  - ${p}`).join('\n')
+  )
+}
 
 const isLinked = db.prepare('SELECT 1 FROM links WHERE mc_uuid = ?')
 const purge = db.prepare('DELETE FROM pending_codes WHERE mc_uuid = ? OR expires_at < ?')
